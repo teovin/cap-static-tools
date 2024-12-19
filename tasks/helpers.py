@@ -20,6 +20,7 @@ S3_CAPTAR_REDACTED_FOLDER = os.environ.get("S3_CAPTAR_REDACTED_FOLDER")
 S3_CAPTAR_UNREDACTED_FOLDER = os.environ.get("S3_CAPTAR_UNREDACTED_FOLDER")
 S3_PDF_FOLDER = os.environ.get("S3_PDF_FOLDER")
 OBJECT_PATHS_FILE = os.environ.get("OBJECT_PATHS_FILE")
+VOLUMES_TO_UNREDACT_FILE = os.environ.get("VOLUMES_TO_UNREDACT_FILE")
 CAP_STATIC_BASE_URL = os.environ.get("CAP_STATIC_BASE_URL")
 
 # clients
@@ -67,6 +68,17 @@ def write_paths_to_file(files, file_name=OBJECT_PATHS_FILE):
     print(f"{len(files)} path pairs were written to txt file.")
 
 
+def write_volumes_to_file(volumes, file_name=VOLUMES_TO_UNREDACT_FILE):
+    """
+    Writes volume reporter and folder information to file
+    """
+    with open(file_name, "w") as file:
+        for volume in volumes:
+            file.write(f"{volume['reporter']}/{volume['volume_folder']}\n")
+
+    print(f"{len(volumes)} volumes were written to txt file.")
+
+
 def get_reporter_volumes_metadata(bucket, reporter):
     """
     Gets the reporter level VolumesMetadata.json contents
@@ -92,3 +104,15 @@ def get_reporter_files(reporter):
 
     return files
 
+
+def get_single_volume_metadata(bucket, reporter, volume, file_type):
+    """
+    Gets the volume level metadata file contents
+    """
+    key = f"{reporter}/{volume}/{file_type}.json"
+    try:
+        metadata = r2_s3_client.get_object(Bucket=bucket, Key=key)
+        return metadata["Body"].read().decode("utf-8")
+    except ClientError as e:
+        print(f"Volume metadata not found in {bucket} bucket: {key}: {e}")
+        return

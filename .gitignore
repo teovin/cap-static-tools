@@ -1,5 +1,7 @@
 .env
 .idea/*
 source_target_paths.txt
+volumes_to_unredact.txt
+VolumesMetadata_backup.json
 __pycache__
 /venv/

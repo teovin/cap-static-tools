@@ -1,121 +1,141 @@
 import json
-
+from datetime import datetime, timezone
 from invoke import task
+import pandas as pd
 
-from .helpers import get_volumes_metadata, get_reporter_volumes_metadata, R2_STATIC_BUCKET, R2_UNREDACTED_BUCKET, \
-    RCLONE_R2_UNREDACTED_BASE_URL, RCLONE_R2_CAP_STATIC_BASE_URL, r2_paginator, r2_s3_client, write_paths_to_file, \
-    s3_paginator, S3_ARCHIVE_BUCKET, S3_PDF_FOLDER, RCLONE_S3_BASE_URL, OBJECT_PATHS_FILE
-
-
-@task
-def pdf_paths(ctx, file_path=OBJECT_PATHS_FILE):
-    """ Creates file path pairs to copy unredacted pdfs from S3 to r2 unredacted bucket. """
-    volumes_metadata = json.loads(get_volumes_metadata())
-    s3_files = {}
-    for page in s3_paginator.paginate(Bucket=S3_ARCHIVE_BUCKET, Prefix=S3_PDF_FOLDER, PaginationConfig={"PageSize": 1000}):
-        for item in page["Contents"]:
-            s3_files[f"{item['volume_id']}/{item['extension']}/"] = {
-                "s3_key": item["Key"],
-                "volume_id": (item["Key"].split("/")[-1]).split(".")[0],
-                "extension": ".pdf",
-            }
-    volume_matches = get_volume_matches_for_artifacts(s3_files, volumes_metadata, ".pdf")
-    write_paths_to_file(volume_matches, file_path)
+from .helpers import (get_volumes_metadata, get_reporter_volumes_metadata, R2_STATIC_BUCKET, R2_UNREDACTED_BUCKET,
+                      RCLONE_R2_UNREDACTED_BASE_URL, RCLONE_R2_CAP_STATIC_BASE_URL, r2_paginator, write_paths_to_file,
+                      write_volumes_to_file, VOLUMES_TO_UNREDACT_FILE, get_single_volume_metadata, r2_s3_client)
 
 
 @task
-def tar_paths(ctx, file_path=OBJECT_PATHS_FILE):
-    """ Creates file path pairs to copy unredacted tars to r2 unredacted bucket. """
-    volumes_metadata = json.loads(get_volumes_metadata())
-    deduped_s3_tars = filter_for_newest_tars()
-    extensions = [".tar", ".tar.csv", ".tar.sha256"]
-    volume_matches = []
-
-    for extension in extensions:
-        volume_matches += get_volume_matches_for_artifacts(deduped_s3_tars, volumes_metadata, extension)
-    write_paths_to_file(volume_matches, file_path)
-
-
-@task
-def volume_paths(ctx, reporter=None, publication_year=None, file_path=OBJECT_PATHS_FILE):
+def unredact_volumes(ctx, volume=None, reporter=None, publication_year=None):
     """
-    Creates file path pairs to copy unredacted volume files from r2 unredacted bucket to static bucket.
-    Must specify either reporter or publication_year.
+    Invoked with
+    `invoke unredact.unredact-volumes --volume=32044109578716` or
+    `invoke unredact.unredact-volumes --reporter=bta` or
+    `invoke unredact.unredact-volumes --publication-year=1930`
+    Creates a txt file with source and target path pairs which later will be used for rclone sync
+    Creates a txt file with reporter and volume folder data which later will be used for metadata json file updates
     """
-    if reporter and publication_year:
-        raise ValueError("Cannot pass reporter and publication_year at the same time.")
+    passed_params = [param for param in [volume, reporter, publication_year] if param is not None]
+    assert len(passed_params) == 1, "Cannot pass more than one parameter at a time."
 
-    if reporter:
-        volumes_to_unredact, volume_matches = create_file_mappings_for_unredaction(reporter, None)
-        print(f"{len(volumes_to_unredact)} volumes to unredact.")
-        if volume_matches:
-            write_paths_to_file(volume_matches, file_path)
-
+    if volume:
+        process_unredaction(volume, None, None)
+    elif reporter:
+        process_unredaction(None, reporter, None)
     elif publication_year:
-        volumes_to_unredact, volume_matches = create_file_mappings_for_unredaction(None, publication_year)
-        print(f"{len(volumes_to_unredact)} volumes to unredact.")
-        if volume_matches:
-            write_paths_to_file(volume_matches, file_path)
-
-    else:
-        raise ValueError("Must pass reporter or publication_year.")
+        process_unredaction(None, None, publication_year)
 
 
 @task
-def update_redacted_field_of_volume(ctx, reporter=None, publication_year=None, dry_run=False):
+def update_redacted_field(ctx, dry_run=False):
     """
-    Updates the redacted flags in top level and reporter level metadata files.
-    If dry_run is passed, won't proceed with the actual json file update
+    The output of the unredact-volumes task is used to decide which volumes need updating.
+    Updates the `redacted` flags in top level, reporter level and volume level volume metadata files.
+    Updates the `last_updated` flag in top level, reporter level and volume level volume metadata files.
+    Updates the `last_updated` flag in the volume level cases metadata json file.
+    If dry-run is passed, won't update the files.
     """
-    if reporter and publication_year:
-        raise ValueError("Cannot pass reporter and publication_year at the same time.")
+    with open(VOLUMES_TO_UNREDACT_FILE, 'r') as volumes_file:
+        if not bool(volumes_file.readlines()):
+            raise Exception(f"Couldn't find any volumes in file.")
 
-    volumes_to_unredact = []
-    if reporter:
-        volumes_to_unredact = create_file_mappings_for_unredaction(reporter, None)[0]
-    if publication_year:
-        volumes_to_unredact = create_file_mappings_for_unredaction(None, publication_year)[0]
-
-    print(f"{len(volumes_to_unredact)} volumes need 'redacted' field update.")
-
-    if volumes_to_unredact and not dry_run:
+        volumes_file.seek(0)
         volumes_metadata = json.loads(get_volumes_metadata(R2_STATIC_BUCKET))
 
-        for item in volumes_to_unredact:
+        # make a backup of top level VolumesMetadata.json file
+        # just in case we need to restore it quickly in the event of a bug
+        with open("VolumesMetadata_backup.json", 'w') as backup_file:
+            json.dump(volumes_metadata, backup_file, indent=4)
+
+        ### update the top level volumes metadata fields ###
+
+        volumes_to_unredact = volumes_file.readlines()
+        for vol in volumes_to_unredact:
+            reporter_slug, volume_folder = map(str.strip, vol.split('/', 1))
             for volume in volumes_metadata:
-                if item["id"] == volume["id"]:
+                if reporter_slug == volume["reporter_slug"] and volume_folder == volume["volume_folder"]:
                     volume["redacted"] = False
+                    volume["last_updated"] = datetime.now(timezone.utc).isoformat()
 
-        r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(volumes_metadata), Key="VolumesMetadata.json",
-                                ContentType="application/json")
+        # upload the new top level VolumesMetadata.json
+        if not dry_run:
+            r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(volumes_metadata),
+                                    Key="VolumesMetadata.json", ContentType="application/json")
+            print("Top level VolumesMetadata.json is updated.")
 
-        if reporter:
+        ### update the reporter level volumes metadata fields ###
+
+        df = pd.read_csv(VOLUMES_TO_UNREDACT_FILE, header=None, names=['volume_string'])
+        df[['reporter', 'volume_folder']] = df['volume_string'].str.split('/', expand=True)
+        grouped_volume_data = df.groupby('reporter')['volume_folder'].apply(list).to_dict()
+
+        for reporter, volumes in grouped_volume_data.items():
             reporter_volumes_metadata = json.loads(get_reporter_volumes_metadata(R2_STATIC_BUCKET, reporter))
-            for item in volumes_to_unredact:
+            for volume_folder in volumes:
                 for volume in reporter_volumes_metadata:
-                    if item["id"] == volume["id"]:
+                    if volume_folder == volume["volume_folder"]:
                         volume["redacted"] = False
+                        volume["last_updated"] = datetime.now(timezone.utc).isoformat()
 
-            r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(reporter_volumes_metadata),
-                                    Key=f"{reporter}/VolumesMetadata.json", ContentType="application/json")
-
-        if publication_year:
-            for item in volumes_to_unredact:
-                reporter_volumes_metadata = json.loads(
-                    get_reporter_volumes_metadata(R2_STATIC_BUCKET, item["reporter"]))
-                for volume in reporter_volumes_metadata:
-                    if item["id"] == volume["id"]:
-                        volume["redacted"] = False
-
+            # upload the new reporter level VolumesMetadata.json
+            if not dry_run:
                 r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(reporter_volumes_metadata),
-                                        Key=f"{item['reporter']}/VolumesMetadata.json", ContentType="application/json")
+                                        Key=f"{reporter}/VolumesMetadata.json", ContentType="application/json")
+                print(f"Reporter level VolumesMetadata.json is updated for reporter {reporter}.")
+
+        ### update the reporter volume level volumes metadata and cases metadata fields ###
+
+        for reporter, volumes in grouped_volume_data.items():
+            for volume_folder in volumes:
+                volume_metadata = json.loads(get_single_volume_metadata(R2_STATIC_BUCKET, reporter, volume_folder, "VolumeMetadata"))
+                cases_metadata = json.loads(get_single_volume_metadata(R2_STATIC_BUCKET, reporter, volume_folder, "CasesMetadata"))
+                volume_metadata["redacted"] = False
+                volume_metadata["last_updated"] = datetime.now(timezone.utc).isoformat()
+                for case in cases_metadata:
+                    case["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+                # upload the new reporter volume level VolumeMetadata.json and CasesMetadata.json
+                if not dry_run:
+                    r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(volume_metadata),
+                                            Key=f"{reporter}/{volume_folder}/VolumeMetadata.json", ContentType="application/json")
+                    print(f"Reporter volume level VolumeMetadata.json is updated for {reporter}/{volume_folder} volume.")
+                    r2_s3_client.put_object(Bucket=R2_STATIC_BUCKET, Body=json.dumps(cases_metadata),
+                                            Key=f"{reporter}/{volume_folder}/CasesMetadata.json", ContentType="application/json")
+                    print(f"Reporter volume level CasesMetadata.json is updated for {reporter}/{volume_folder} volume.")
 
 
-def create_file_mappings_for_unredaction(reporter=None, publication_year=None):
+def process_unredaction(volume, reporter, publication_year):
+    """
+    Helper function for the unredaction process
+    """
+    volumes_to_unredact, volume_matches = create_file_mappings_for_unredaction(volume, reporter, publication_year)
+    print(f"{len(volumes_to_unredact)} volumes need to be unredacted.")
+    if volume_matches:
+        write_paths_to_file(volume_matches)
+        write_volumes_to_file(volumes_to_unredact)
+
+def create_file_mappings_for_unredaction(volume=None, reporter=None, publication_year=None):
     """
     Creates a list of volumes that need unredaction
     Creates a list of files that need to be copied to static bucket
     """
+    if volume:
+        unredacted_bucket_volumes = get_volumes_metadata(R2_UNREDACTED_BUCKET)
+        static_bucket_volumes = get_volumes_metadata(R2_STATIC_BUCKET)
+        unredacted_bucket_volume = [item for item in json.loads(unredacted_bucket_volumes) if item.get("id") == volume]
+        static_bucket_volume = [item for item in json.loads(static_bucket_volumes) if item.get("id") == volume]
+
+        if not unredacted_bucket_volume:
+            raise Exception(f"Did not find the volume in {R2_UNREDACTED_BUCKET} bucket")
+
+        if not static_bucket_volume:
+            raise Exception(f"Did not find the volume in {R2_STATIC_BUCKET} bucket")
+
+        return map_files_for_unredaction(static_bucket_volume, unredacted_bucket_volume)
+
     if reporter:
         unredacted_bucket_volumes = get_reporter_volumes_metadata(R2_UNREDACTED_BUCKET, reporter)
         static_bucket_volumes = get_reporter_volumes_metadata(R2_STATIC_BUCKET, reporter)
@@ -142,7 +162,7 @@ def create_file_mappings_for_unredaction(reporter=None, publication_year=None):
 
 def map_files_for_unredaction(static_volumes, unredacted_volumes):
     """
-    Filters out non qualifying volumes
+    Skips volumes that are already flagged as `unredacted`
     Returns the ids of volumes that need to be unredacted
     Returns a list of files that need replacing in static bucket
     """
@@ -155,8 +175,8 @@ def map_files_for_unredaction(static_volumes, unredacted_volumes):
 
         if volume["id"] in [unredacted_vol["id"] for unredacted_vol in unredacted_volumes]:
             volumes_to_unredact.append({
-                "id": volume["id"],
-                "reporter": volume["reporter_slug"]
+                "reporter": volume["reporter_slug"],
+                "volume_folder": volume["volume_folder"]
             })
             files.extend(get_unredacted_volume_files(volume))
 
@@ -165,7 +185,7 @@ def map_files_for_unredaction(static_volumes, unredacted_volumes):
 
 def get_unredacted_volume_files(volume):
     """
-    Returns a list of volumes files from unredacted bucket
+    Returns a list of dictionaries with volume file source and destination paths
     """
     key_prefix = f"{volume['reporter_slug']}/{volume['volume_folder']}"
     extensions = ["pdf", "zip", "tar", "tar.csv", "tar.sha256"]
@@ -196,58 +216,3 @@ def get_unredacted_volume_files(volume):
 
     return volume_files
 
-
-def get_volume_matches_for_artifacts(s3_files, volumes_metadata, file_type):
-    """
-    Finds volume - s3 file matches for s3 r2 sync
-    """
-    volume_matches = []
-
-    for volume in volumes_metadata:
-        volume_key = f"{volume['id']}/{file_type}/"
-
-        if volume["redacted"]:
-            print("Skipping redacted volume.")
-            continue
-
-        if volume_key in s3_files:
-            s3_file = s3_files.get(volume_key)
-            volume_matches.append(
-                {
-                    "source": f"{RCLONE_S3_BASE_URL}{s3_file['s3_key']}",
-                    "destination": f"{RCLONE_R2_UNREDACTED_BASE_URL}{volume['reporter_slug']}/{volume['volume_folder']}{file_type}"
-                }
-            )
-
-    return volume_matches
-
-
-def filter_for_newest_tars():
-    """
-    There can be multiple versions of tar files for the same volume in archive bucket
-    Removes duplicate files by selecting the most recent one for each extension
-    """
-    grouped_data = defaultdict(list)
-
-    for page in s3_paginator.paginate(Bucket=S3_ARCHIVE_BUCKET, Prefix=S3_CAPTAR_UNREDACTED_FOLDER, PaginationConfig={"PageSize": 1000}):
-        for item in page["Contents"]:
-            volume_id = (item["Key"].split("/")[-1]).split("_unredacted")[0]
-            ts_result = re.search(r"\d{4}_\d{2}_\d{2}_\d{2}\.\d{2}\.\d{2}", item["Key"])
-            timestamp = "1600" if ts_result is None else ts_result.group(0)
-            grouped_data[(item["volume_id"], item["extension"])].append({
-                "s3_key": item["Key"],
-                "volume_id": volume_id,
-                "extension": item["Key"][item["Key"].index(".tar"):],
-                "timestamp": timestamp,
-            })
-
-    unique_items = []
-
-    for key, items in grouped_data.items():
-        if len(items) == 1:
-            unique_items.append(items[0])
-        else:
-            newest_item = max(items, key=lambda x: x["timestamp"])
-            unique_items.append(newest_item)
-
-    return {f"{file['volume_id']}/{file['extension']}/": file for file in unique_items}
